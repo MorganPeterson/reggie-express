@@ -1,247 +1,79 @@
--- x/regex/ - matches all the text that matches the regular expression
--- y/regex/ - matches all the text that does not match the regular expression
--- g/regex/ - if the regex finds a match in the string then the whole string
---            is passed
--- v/regex/ - if the regex does not find a match in the string then the whole
---            string is passed along.
+local xflag = true
+local wflag = true
+local eflag = true
+local fflag = false
+local matchall = true
 
----- TOKEN -------------------------------------------------------------------
-local token = {}
+local pattern = ""
 
-function token.element(char)
-    return {
-        type='element',
-        char=char
-    }
-end
+local function add_pattern(pat, len)
+    -- match all or die trying
+    if not xflag and (len == 0 or matchall) then
+        matchall = false
+        return
+    end
 
-function token.wildcard()
-    return {
-        type='wildcard',
-        char='.'
-    }
-end
+    -- trim newline
+    if len > 0 and pat:sub(len, len) == '\n' then
+        len = len - 1
+    end
 
-function token.start()
-    return {
-        type='start',
-        char='^'
-    }
-end
+    -- pattern can not be null terminated
+    if wflag and not fflag then
+        local bol = ''
+        local eol = ''
+        local extra = 4
+        local eflag_str = {'\\(', '\\)'}
 
-function token.the_end()
-    return {
-        type='end',
-        char='$'
-    }
-end
+        if pat:sub(1,1) == '^' then
+            bol = '^'
+        end
 
-function token.escape()
-    return {
-        type='escape',
-        char='\\'
-    }
-end
+        if len > 0 and pat:sub(len,len) == '$' then
+            eol = '$'
+        end
 
-function token.comma()
-    return {
-        type='comma',
-        char=','
-    }
-end
+        if eflag then
+            eflag_str[1] = '('
+            eflag_str[2] = ')'
+            extra = 2
+        end
 
-function token.left_parenthesis()
-    return {
-        type='parenthesis',
-        side='left',
-        char='('
-    }
-end
+        local new_pattern = string.format(
+            "%s[[:<:]]%s%s%s[[:>:]]%s",
+            bol,
+            eflag_str[1],
+            pat:sub(bol:len()+1,pat:len() - eol:len()),
+            eflag_str[2],
+            eol)
 
-function token.right_parenthesis()
-    return {
-        type='parenthesis',
-        side='right',
-        char=')'
-    }
-end
-
-function token.left_brace()
-    return {
-        type='brace',
-        side='left',
-        char='{'
-    }
-end
-
-function token.right_brace()
-    return {
-        type='brace',
-        side='right',
-        char='}'
-    }
-end
-
-function token.left_bracket()
-    return {
-        type='bracket',
-        side='left',
-        char='['
-    }
-end
-
-function token.right_bracket()
-    return {
-        type='brace',
-        side='right',
-        char=']'
-    }
-end
-
-function token.asterisk()
-    return {
-        type='quantifier',
-        quantity='zeroOrMore',
-        char="*"
-    }
-end
-
-function token.plus()
-    return {
-        type='quantifier',
-        quantity='oneOrMore',
-        char='+'
-    }
-end
-
-function token.question_mark()
-    return {
-        type='quantifier',
-        quantity='zeroOrOne',
-        char='?'
-    }
-end
-
-function token.vertical_bar()
-    return {
-        type='or',
-        char='|'
-    }
-end
-
-function token.circumflex()
-    return {
-        type='not',
-        char='^'
-    }
-end
-
-function token.dash()
-    return {
-        type='dash',
-        char='-'
-    }
-end
-
--- END TOKEN =================================================================
-
--- PARSER --------------------------------------------------------------------
-local function read_input(input)
-    -- get the first character of a string
-    return input:sub(1, 1)
-end
-
-local function input_advance(input)
-    -- remove first character and return rest of string
-    return input:sub(2)
-end
-
-local function create_result(...)
-    -- varadic function returns a table of all args
-    return {...}
-end
-
-local function handle_escapes(input, callback)
-    local adv = input_advance(input)
-    local next_char = read_input(adv)
-    if next_char == 't' then
-        return create_result(callback('\t'), input_advance(adv))
+        pattern = string.format('%s%s', pattern, new_pattern)
+        len = 14 + extra
     else
-        return create_result(callback(next_char), input_advance(adv))
+        pattern = string.format('%s%s', pattern, pat)
+    end
+    return len
+end
+
+local function add_patterns(pats)
+    -- read patterns from a stream
+    for s in pats:gmatch('[^\n]+') do
+        add_pattern(s, s:len())
     end
 end
 
-local function lit(ch, callback)
-    -- checks if character (ch) is the first in a string
-    return function(input)
-        local r = read_input(input)
-        if r == ch then
-            -- handle escapes
-            if ch == '\\' then
-                return handle_escapes(input, callback)
-            end
-            return create_result(callback(ch), input_advance(input))
-        else
-            return create_result(nil, input)
-        end
+local function read_patterns(file_name)
+    -- read patterns from a file
+    local f = assert(io.open(file_name, "rb"))
+    while true do
+        local line = f:read()
+        if line == nil then break end
+        add_pattern(line, line:len())
     end
+    f:close()
 end
 
-local function parser_or(...)
-    local vargs = {...}
-    return function(input)
-        for _, func in ipairs(vargs) do
-            local result = func(input)
-            if result[1] ~= nil then
-                return result
-            end
-        end
-        local r = read_input(input)
-        return create_result(token.element(r), input_advance(input))
-    end
-end
+local test = "^ab?c\\d.*ef^go\td\nabcd?ef$\n"
+add_patterns(test)
 
-local parser = parser_or(
-    lit('.', token.wildcard),
-    lit('\\', token.element),
-    lit('(', token.left_parenthesis),
-    lit(')', token.right_parenthesis),
-    lit('{', token.left_brace),
-    lit('}', token.right_brace),
-    lit('[', token.left_bracket),
-    lit(']', token.right_bracket),
-    lit('^', token.circumflex),
-    lit('$', token.the_end),
-    lit('?', token.question_mark),
-    lit('*', token.asterisk),
-    lit('+', token.plus),
-    lit('|', token.vertical_bar),
-    lit('-', token.dash))
-
--- END PARSER ================================================================
-
--- LEXER ---------------------------------------------------------------------
-local lexed = {}
-
-local test = "^ab?c\\d.*ef^go\td"
-
-for i = 1, #test do
-    if i == 1 and test:sub(1,1) == '^' then
-        lexed[i] = {token.start(), test:sub(2)}
-        i = i + 1
-    else
-        lexed[i] = parser(test:sub(i))
-    end
-end
-
-for k, v in ipairs(lexed) do
-    for kk, vv in ipairs(v) do
-        if kk == 1 then
-            for kkk, vvv in pairs(vv) do
-                print(kkk, vvv)
-            end
-        else
-            print(kk, vv)
-        end
-    end
-end
+print(pattern)
