@@ -69,6 +69,13 @@ function getopt(optstring, ...)
     end)
 end
 
+local function usage()
+    io.stderr:write(
+        string.format(
+            "usage: mregex [-%s] [pattern] [file ...]\n", optstr))
+    return 1
+end
+
 local function add_pattern(pat, len)
     -- match all or die trying
     if not xflag and (len == 0 or matchall) then
@@ -141,6 +148,7 @@ local newarg = nil
 local optindex = 1
 local prevoptindex = 0
 local need_pattern = true
+local file_names = {}
 
 for opt, arg in getopt(optstr, ...) do
     local opt_num = tonumber(opt)
@@ -199,16 +207,31 @@ for opt, arg in getopt(optstr, ...) do
     elseif opt == 'x' then
         xflag = true
     else
-        usage()
+        if not opt and arg then
+            if need_pattern then
+                add_patterns(arg)
+                need_pattern=false
+            else
+                table.insert(file_names, arg)
+            end
+        else
+            return usage()
+        end
     end
     lastopt = opt
     newarg = optindex ~= prevoptindex
     prevoptindex = optindex
     optindex = optindex + 1
+
 end
 
 
 local test = "^ab?c\\d.*ef^go\td\nabcd?ef$\n"
 add_patterns(test)
+need_pattern = false
+
+if need_pattern then
+    return usage()
+end
 
 print(pattern)
