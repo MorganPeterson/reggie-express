@@ -1,237 +1,188 @@
-local Aflag = 0
-local Bflag = 0
-local bflag = false
-local xflag = false
-local wflag = false
-local eflag = false
-local fflag = false
-local gflag = true
-local matchall = true
+local bit = require("bit")
 
-local optstr= "0123456789A:B:C:EFGHILPSRUVZabce:f:hilnoqrsuvwxy"
-local pattern = ""
-local opt_table = {}
+local UTFMax = 4 -- max bytes per rune
+local RuneMax = 0x10FFF -- max rune value
 
-function getopt(optstring, ...)
-    local opts = { }
-    local args = { ... }
+local Bit1 = 7
+local BitX = 6
+local Bit2 = 5
+local Bit3 = 4
+local Bit4 = 3
+local Bit5 = 2
 
-    for optc, optv in optstring:gmatch"(%a)(:?)" do
-        opts[optc] = { hasarg = optv == ":" }
+local Tx = bit.bxor((bit.lshift(1, (BitX + 1))-1), 0xFF)
+local T2 = bit.bxor((bit.lshift(1, (Bit2 + 1))-1), 0xFF)
+local T3 = bit.bxor((bit.lshift(1, (Bit3 + 1))-1), 0xFF)
+local T4 = bit.bxor((bit.lshift(1, (Bit4 + 1))-1), 0xFF)
+local T5 = bit.bxor((bit.lshift(1, (Bit5 + 1))-1), 0xFF)
+local Rune1 = bit.lshift(1, (Bit1+0*BitX))-1
+local Rune2 = bit.lshift(1, (Bit2+1*BitX))-1
+local Rune3 = bit.lshift(1, (Bit3+2*BitX))-1
+local Rune4 = bit.lshift(1, (Bit4+3*BitX))-1
+
+local MaskX = bit.lshift(1, BitX)-1
+local TestX = bit.bxor(MaskX, 0xFF)
+
+local runeError = "byte not valid"
+local char_pattern = "[%z\x01-\x7F\xC2-\xF4][\x80-\xBF]*"
+
+local function char_to_rune(char)
+    local c = char:byte(1)
+    -- one character sequence
+    if c < Tx then
+        return {rune=c, length=1}
     end
 
-    return coroutine.wrap(function()
-        local yield = coroutine.yield
-        local i = 1
+    -- two character sequence
+    local c1 = bit.bxor(char:byte(2), Tx)
+    if bit.band(c1, TestX) ~= 0 then
+        return nil, runeError, 21
+    end
 
-        while i <= #args do
-            local arg = args[i]
+    if c < T3 then
+        if c < T2 then
+            return nil, runeError, 22
+        end
+        local l = bit.band(bit.bor(bit.lshift(c, BitX), c1), Rune2)
+        if l <= Rune1 then
+            return nil, runeError, 23
+        end
+        return {rune=l, length=2}
+    end
 
-            i = i + 1
+    local c2 = bit.bxor(char:byte(3), Tx)
+    if bit.band(c2, TestX) ~= 0 then
+        return nil, runeError, 31
+    end
 
-            if arg == "--" then
-                break
-            elseif arg:sub(1, 1) == "-" then
-                for j = 2, #arg do
-                    local opt = arg:sub(j, j)
+    if c < T4 then
+        local l = bit.band(
+            bit.bor(
+                bit.lshift(
+                    bit.bor(
+                        bit.lshift(c, BitX),c1),BitX), c2), Rune3)
+        if l <= Rune2 then
+            return nil, runeError, 32
+        end
+        return {rune=l, length=3}
+    end
 
-                    if opts[opt] then
-                        if opts[opt].hasarg then
-                            if j == #arg then
-                                if args[i] then
-                                    yield(opt, args[i])
-                                    i = i + 1
-                                elseif optstring:sub(1, 1) == ":" then
-                                    yield(':', opt)
-                                else
-                                    yield('?', opt)
-                                end
-                            else
-                                yield(opt, arg:sub(j + 1))
-                            end
+    if UTFMax >= 4 then
+        local c3 = bit.bxor(char:byte(4), Tx)
+        if bit.band(c3, TestX) then
+            return nil, runeError, 41
+        end
 
-                            break
-                        else
-                            yield(opt, false)
-                        end
-                    else
-                        yield('?', opt)
-                    end
-                end
-            else
-                yield(false, arg)
+        if c < T5 then
+            local l = bit.band(
+                bit.bor(
+                    bit.lshift(
+                        bit.bor(
+                            bit.lshift(
+                                bit.bor(
+                                    bit.lshift(c, BitX)
+                                , c1)
+                            , BitX)
+                        , c2)
+                    , BitX)
+                , c3), Rune4)
+            if l <= Rune3 then
+                return nil, runeError, 42
             end
+            if l > RuneMax then
+                return nil, runeError, 43
+            end
+            return {rune=l, length=4}
         end
-
-        for i = i, #args do
-            yield(false, args[i])
-        end
-    end)
+    end
+    return nil, runeError, 1
 end
 
-local function usage()
-    io.stderr:write(
-        string.format(
-            "usage: mregex [-%s] [pattern] [file ...]\n", optstr))
-    return 1
+local LISTSIZE = 10
+local BIGLISTSIZE = 25 * LISTSIZE
+local NSUBEXP = 32
+local NSTACK = 20
+local LEXDONE = false
+local YYRUNE = 0
+
+local RUNE = 0177
+local OPERATOR = 0200 -- Bitmask of all operators
+local START = 0200 -- Start, used for marker on stack
+local RBRA = 0201 -- Right bracket, )
+local LBRA= 0202 -- Left bracket, (
+local OR = 0203 -- Alternation, |
+local CAT = 0204 -- Concatentation, implicit operator
+local STAR = 0205 -- Closure, *
+local PLUS = 0206 -- a+ == aa*
+local QUEST = 0207 -- a? == a|nothing, i.e. 0 or 1 a's
+local ANY = 0300 -- Any character except newline, .
+local ANYNL = 0301 -- Any character including newline, .
+local NOP = 0302 -- No operation, internal use only
+local BOL = 0303 -- Beginning of line, ^
+local EOL = 0304 -- End of line, $
+local CCLASS = 0305 -- Character class, []
+local NCCLASS = 0306 -- Negated character class, []
+local END = 0377 -- Terminate: match found
+
+local lexer_table = {}
+table.insert(lexer_table, 0, END)
+lexer_table['*'] = STAR
+lexer_table['?'] = QUEST
+lexer_table['+'] = PLUS
+lexer_table['|'] = OR
+lexer_table['('] = LBRA
+lexer_table[')'] = RBRA
+lexer_table['^'] = BOL
+lexer_table['$'] = EOL
+lexer_table['['] = bldcclass
+
+local function nextc(exprp)
+    if LEXDONE then
+        return true, nil
+    end
+    
+    local val, msg, err = char_to_rune(exprp)
+    if err then
+        io.stderr:write(string.format("[%s] %s\n", err, msg))
+        return true, nil
+    end
+    
+    if val.rune == string.byte('\\') then
+        val, msg, err = char_to_rune(exprp)
+        if err then
+            io.stderr:write(string.format("[%s] %s\n", err, msg))
+            return true, nil
+        end
+        return true, val.rune
+    end
+
+    if val.rune == 0 then
+        LEXDONE = true, val.rune
+    end
+    return false, val.rune
 end
 
-local function add_pattern(pat, len)
-    -- match all or die trying
-    if not xflag and (len == 0 or matchall) then
-        matchall = false
-        return
+local function lexer(rune, literal, dot_type)
+    lexer_table['.'] = dot_type
+    local quoted, new_rune = nextc(rune)
+    
+    if literal or quoted then
+        if new_rune == 0 then
+            return END
+        end
+        return RUNE
     end
 
-    -- trim newline
-    if len > 0 and pat:sub(len, len) == '\n' then
-        len = len - 1
-    end
-
-    -- pattern can not be null terminated
-    if wflag and not fflag then
-        local bol = ''
-        local eol = ''
-        local extra = 4
-        local eflag_str = {'\\(', '\\)'}
-
-        if pat:sub(1,1) == '^' then
-            bol = '^'
-        end
-
-        if len > 0 and pat:sub(len,len) == '$' then
-            eol = '$'
-        end
-
-        if eflag then
-            eflag_str[1] = '('
-            eflag_str[2] = ')'
-            extra = 2
-        end
-
-        local new_pattern = string.format(
-            "%s[[:<:]]%s%s%s[[:>:]]%s",
-            bol,
-            eflag_str[1],
-            pat:sub(bol:len()+1,pat:len() - eol:len()),
-            eflag_str[2],
-            eol)
-
-        pattern = string.format('%s%s', pattern, new_pattern)
-        len = 14 + extra
+    local rune_type = lexer_table[rune]
+    if not rune_type then
+        return RUNE
     else
-        pattern = string.format('%s%s', pattern, pat)
-    end
-    return len
-end
-
-local function add_patterns(pats)
-    -- read patterns from a stream
-    for s in pats:gmatch('[^\n]+') do
-        add_pattern(s, s:len())
+        return rune_type
     end
 end
 
-local function read_patterns(file_name)
-    -- read patterns from a file
-    local f = assert(io.open(file_name, "rb"))
-    while true do
-        local line = f:read()
-        if line == nil then break end
-        add_pattern(line, line:len())
-    end
-    f:close()
-end
+local testStr = "是四艘国王级战列舰的第二艘舰"
+local testChar1 = testStr:sub(1,3)
+local testChar2 = '+'
 
-local lastopt = nil
-local newarg = nil
-local optindex = 1
-local prevoptindex = 0
-local need_pattern = true
-local file_names = {}
-
-for opt, arg in getopt(optstr, ...) do
-    local opt_num = tonumber(opt)
-    if opt_num and opt_num > -1 and opt_num < 10 then
-        if newarg or tonumber(lastc) == nil then
-            Aflag = 0
-        end
-        Bflag = (Aflag * 10) + opt_num
-        Aflag = Bflag
-    elseif opt == 'A' or opt == 'B' then
-        local arg_num = tonumber(arg)
-        if not arg_num or arg_num <= 0 then
-            print(2, "context out of range")
-            return
-        end
-        if opt == 'A' then
-            Aflag = arg_num
-        else
-            Bflag = arg_num
-        end
-    elseif opt == 'b' then
-        bflag = true
-    elseif opt == 'C' then
-        if not arg then
-            Aflag = 2
-            Bflag = 2
-        else
-            local arg_num = tonumber(arg)
-            if not arg_num or arg_num <= 0 then
-                print(2, "context out of range")
-                return
-            end
-            Aflag = arg_num
-            Bflag = arg_num
-        end
-    elseif opt == 'e' then
-        add_patterns(arg)
-        need_pattern = false
-    elseif opt == 'E' then
-        eflag = true
-        fflag = false
-        gflag = false
-    elseif opt == 'f' then
-        read_patterns(arg)
-        need_pattern = false
-    elseif opt == 'F' then
-        eflag = false
-        fflag = true
-        gflag = false
-    elseif opt == 'F' then
-        eflag = false
-        fflag = false
-        gflag = true
-    elseif opt == 'w' then
-        wflag = true
-    elseif opt == 'x' then
-        xflag = true
-    else
-        if not opt and arg then
-            if need_pattern then
-                add_patterns(arg)
-                need_pattern=false
-            else
-                table.insert(file_names, arg)
-            end
-        else
-            return usage()
-        end
-    end
-    lastopt = opt
-    newarg = optindex ~= prevoptindex
-    prevoptindex = optindex
-    optindex = optindex + 1
-
-end
-
-
-local test = "^ab?c\\d.*ef^go\td\nabcd?ef$\n"
-add_patterns(test)
-need_pattern = false
-
-if need_pattern then
-    return usage()
-end
-
-print(pattern)
+print(lexer(testChar2, false, '.'))
